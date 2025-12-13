@@ -1,12 +1,11 @@
-## === fgit (高速リポジトリ移動) ===
 fgit() {
   emulate -L zsh
   setopt localoptions pipefail no_aliases
 
   local base=${1:-$HOME}
   local depth=${FGIT_DEPTH:-5}
-
   base=${base:A}
+
   if [[ ! -d $base ]]; then
     print -u2 "fgit: base is not a directory: $base"
     return 2
@@ -16,78 +15,79 @@ fgit() {
     return 127
   fi
 
-  # 外側シェル（この関数）用にクォート済みの base
-  local base_q=${(q)base}
-  local depth_q=${(q)depth}
+  # --- 1. コマンドの事前解決 (ループ内で判定しない) ---
 
-  # bat / batcat 吸収
-  local bat_cmd=bat
-  command -v bat >/dev/null 2>&1 || { command -v batcat >/dev/null 2>&1 && bat_cmd=batcat; }
+  # ls / tree コマンド
+  local list_cmd="ls -F"
+  if command -v eza >/dev/null 2>&1; then
+    list_cmd="eza --tree --level=2 --color=always"
+  elif command -v tree >/dev/null 2>&1; then
+    list_cmd="tree -L 2"
+  fi
 
-  # リポジトリ列挙（.git がディレクトリ/ファイル両方に対応。/.git/ 配下は除外）
-  local cmd_repos
-  cmd_repos="zsh -c '
-    base=\$1
-    depth=\$2
+  # bat / cat コマンド
+  local cat_cmd="head -n 120"
+  if command -v bat >/dev/null 2>&1; then
+    cat_cmd="bat --style=numbers --color=always --line-range :120"
+  elif command -v batcat >/dev/null 2>&1; then
+    cat_cmd="batcat --style=numbers --color=always --line-range :120"
+  fi
 
-    if command -v fd >/dev/null 2>&1; then
-      fd -H -I -t d -t f --max-depth \"\$depth\" \"^\\\\.git\$\" \"\$base\" -x echo {//} 2>/dev/null
-    else
-      find \"\$base\" -maxdepth \"\$depth\" \\( -name .git -type d -o -name .git -type f \\) 2>/dev/null \
-        | sed \"s|/\\\\.git\$||\"
-    fi \
-      | command grep -v \"/\\\\.git/\" \
-      | LC_ALL=C sort -u
-  ' _ $base_q $depth_q"
+  # リポジトリ検索コマンド (fd 優先)
+  # .git フォルダ/ファイルを探し、その親ディレクトリ(リポジトリルート)を表示
+  local cmd_repos_run
+  if command -v fd >/dev/null 2>&1; then
+    # fd: -H(隠し) -I(ignore無視) -t d/f(dir/file)
+    # {//} で親ディレクトリのみ出力するため sed 不要
+    cmd_repos_run="fd -H -I -t d -t f --max-depth $depth '^\\.git$' ${(q)base} -x echo {//}"
+  else
+    # find: 遅いがフォールバック用
+    cmd_repos_run="find ${(q)base} -maxdepth $depth \\( -name .git -type d -o -name .git -type f \\) 2>/dev/null | sed 's|/\\.git\$||'"
+  fi
+  # 共通フィルタ: /.git/ 配下を除外してソート
+  local cmd_repos="$cmd_repos_run | grep -v '/\\.git/' | LC_ALL=C sort -u"
 
-  # README 内を検索して候補ディレクトリを返す（クエリは引数で受け取る）
-  local cmd_grep
-  cmd_grep="zsh -c '
-    q=\$1
-    base=\$2
-    [[ -n \$q ]] || exit 0
+  # README検索コマンド (rg 優先)
+  local cmd_grep_gen
+  if command -v rg >/dev/null 2>&1; then
+    # rg: -m 1 (1行マッチしたら次へ), -l (ファイル名のみ), --no-messages
+    # sed でファイル名を除去して親ディレクトリ化
+    cmd_grep_gen() {
+      echo "rg --files-with-matches --max-count 1 --glob 'README*' --smart-case --no-messages -- \"$1\" ${(q)base} | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
+    }
+  else
+    cmd_grep_gen() {
+      echo "grep -rl --include='README*' -- \"$1\" ${(q)base} 2>/dev/null | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
+    }
+  fi
 
-    if command -v rg >/dev/null 2>&1; then
-      rg --files-with-matches --glob \"README*\" --smart-case -- \"\$q\" \"\$base\" 2>/dev/null
-    else
-      grep -rl --include=\"README*\" -- \"\$q\" \"\$base\" 2>/dev/null
-    fi \
-      | sed \"s|/[^/]*\$||\" \
-      | command grep -v \"/\\\\.git/\" \
-      | LC_ALL=C sort -u
-  ' _ {q} $base_q"
-
-  # プレビュー（README 優先。ついでに軽い Git 情報を表示）
-  local preview_cmd
-  preview_cmd="zsh -c '
-    target=\$1
-    [[ -d \$target ]] || { print -r -- \"Not a directory: \$target\"; exit 0; }
-
-    if command -v git >/dev/null 2>&1 && git -C \"\$target\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      print -P \"%F{cyan}%B[git]%b%f \$(git -C \"\$target\" rev-parse --abbrev-ref HEAD 2>/dev/null)\"
-      git -C \"\$target\" status -sb 2>/dev/null | head -n 20
-      print
-    fi
-
-    readme=\$(find \"\$target\" -maxdepth 1 -iname \"readme*\" -type f -print -quit 2>/dev/null)
-    if [[ -n \$readme ]]; then
-      if command -v $bat_cmd >/dev/null 2>&1; then
-        $bat_cmd --style=numbers --color=always --line-range :120 \"\$readme\"
+  # --- 2. Preview コマンドの最適化 ---
+  # シェル変数を埋め込んで、fzf内で条件分岐を極力減らす
+  # git status は重い場合があるのでタイムアウトなどを考慮しても良いが、ここではシンプルに保持
+  local preview_cmd="
+    target={}; 
+    if [ -d \"\$target\" ]; then
+      if [ -d \"\$target/.git\" ] || [ -f \"\$target/.git\" ]; then
+        echo -e \"\x1b[36m[git]\x1b[m \$(git -C \"\$target\" rev-parse --abbrev-ref HEAD 2>/dev/null)\";
+        git -C \"\$target\" status -sb 2>/dev/null | head -n 20;
+        echo;
+      fi;
+      readme=\$(find \"\$target\" -maxdepth 1 -iname \"readme*\" -type f -print -quit 2>/dev/null);
+      if [ -n \"\$readme\" ]; then
+        $cat_cmd \"\$readme\";
       else
-        head -n 120 \"\$readme\"
-      fi
-      exit 0
-    fi
-
-    print -P \"%F{yellow}[No README found]%f\"
-    if command -v eza >/dev/null 2>&1; then
-      eza --tree --level=2 --color=always \"\$target\" 2>/dev/null | head -n 200
-    elif command -v tree >/dev/null 2>&1; then
-      tree -L 2 \"\$target\" 2>/dev/null | head -n 200
+        echo -e \"\x1b[33m[No README found]\x1b[m\";
+        $list_cmd \"\$target\" 2>/dev/null | head -n 200;
+      fi;
     else
-      ls -F \"\$target\" 2>/dev/null | head -n 40
+      echo \"Not a directory: \$target\";
     fi
-  ' _ {}"
+  "
+  # 改行を詰めて1行にする（fzfへの渡しやすさのため）
+  preview_cmd=${preview_cmd//  /} 
+  preview_cmd=${preview_cmd//$'\n'/ }
+
+  # --- 3. FZF 実行 ---
 
   local selected
   selected=$(
@@ -99,13 +99,13 @@ fgit() {
       --bind "start:reload:$cmd_repos" \
       --bind "ctrl-g:transform:
         if [[ \"{fzf:prompt}\" == \"Repos> \" ]]; then
-          echo 'change-prompt(Grep> )+clear-query+rebind(change)+reload($cmd_grep)'
+          echo 'change-prompt(Grep> )+clear-query+rebind(change)+reload:$(cmd_grep_gen {q})'
         else
           echo 'change-prompt(Repos> )+unbind(change)+reload($cmd_repos)'
         fi" \
       --bind "change:transform:
         if [[ \"{fzf:prompt}\" == \"Grep> \" ]]; then
-          echo 'reload($cmd_grep)'
+          echo 'reload:$(cmd_grep_gen {q})'
         fi"
   )
 
