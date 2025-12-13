@@ -1,4 +1,4 @@
-## === fgit (高速リポジトリ/プロジェクト移動) ===
+## === fgit (高速リポジトリ/プロジェクト移動) === 
 fgit() {
   emulate -L zsh
   setopt localoptions pipefail no_aliases
