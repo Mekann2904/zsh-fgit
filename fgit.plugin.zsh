@@ -15,7 +15,24 @@ fgit() {
     return 127
   fi
 
-  # --- 1. コマンドの事前解決 (ループ内で判定しない) ---
+  # --- 0. 除外したいディレクトリの設定 ---
+  # uv, conda, npm, cargo などのキャッシュやシステムディレクトリを指定
+  local ignore_dirs=(
+    ".cache"        # uv, pip, yarn などのキャッシュ
+    "anaconda3"     # Anaconda
+    "miniconda3"    # Miniconda
+    ".conda"        # Conda environments
+    ".npm"          # npm cache
+    "node_modules"  # プロジェクト内の依存パッケージ
+    ".cargo"        # Rust cargo registry
+    ".pyenv"        # pyenv versions (ソースコードを含む場合があるため)
+    ".rbenv"        # rbenv versions
+    "Library"       # macOS Library
+    ".local"        # Linux local/share など
+    "go"            # Go path (意図して管理している場合は外してください)
+  )
+
+  # --- 1. コマンドの事前解決 ---
 
   # ls / tree コマンド
   local list_cmd="ls -F"
@@ -33,37 +50,48 @@ fgit() {
     cat_cmd="batcat --style=numbers --color=always --line-range :120"
   fi
 
-  # リポジトリ検索コマンド (fd 優先)
-  # .git フォルダ/ファイルを探し、その親ディレクトリ(リポジトリルート)を表示
-  local cmd_repos_run
-  if command -v fd >/dev/null 2>&1; then
-    # fd: -H(隠し) -I(ignore無視) -t d/f(dir/file)
-    # {//} で親ディレクトリのみ出力するため sed 不要
-    cmd_repos_run="fd -H -I -t d -t f --max-depth $depth '^\\.git$' ${(q)base} -x echo {//}"
-  else
-    # find: 遅いがフォールバック用
-    cmd_repos_run="find ${(q)base} -maxdepth $depth \\( -name .git -type d -o -name .git -type f \\) 2>/dev/null | sed 's|/\\.git\$||'"
-  fi
-  # 共通フィルタ: /.git/ 配下を除外してソート
-  local cmd_repos="$cmd_repos_run | grep -v '/\\.git/' | LC_ALL=C sort -u"
+  # --- 2. 検索コマンドの構築 (除外設定の反映) ---
 
-  # README検索コマンド (rg 優先)
-  local cmd_grep_gen
-  if command -v rg >/dev/null 2>&1; then
-    # rg: -m 1 (1行マッチしたら次へ), -l (ファイル名のみ), --no-messages
-    # sed でファイル名を除去して親ディレクトリ化
+  local cmd_repos_run
+  local cmd_grep_base
+
+  if command -v fd >/dev/null 2>&1; then
+    # fd 用の除外オプション生成 (-E "dir1" -E "dir2" ...)
+    local fd_excludes=""
+    for d in $ignore_dirs; do fd_excludes+=" -E ${(q)d}"; done
+    
+    # リポジトリ検索 (fd)
+    cmd_repos_run="fd -H -I -t d -t f --max-depth $depth $fd_excludes '^\\.git$' ${(q)base} -x echo {//}"
+    
+    # Grep検索用 (rg) - fdと同様の除外をglobで指定
+    local rg_excludes=""
+    for d in $ignore_dirs; do rg_excludes+=" --glob '!${(q)d}'"; done
+    
+    cmd_grep_base="rg --files-with-matches --max-count 1 --glob 'README*' --smart-case --no-messages $rg_excludes"
     cmd_grep_gen() {
-      echo "rg --files-with-matches --max-count 1 --glob 'README*' --smart-case --no-messages -- \"$1\" ${(q)base} | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
+      echo "$cmd_grep_base -- \"$1\" ${(q)base} | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
     }
+
   else
+    # find 用の除外オプション生成 (-name "dir1" -prune -o -name "dir2" -prune -o ...)
+    local find_prunes=""
+    for d in $ignore_dirs; do find_prunes+=" -name ${(q)d} -prune -o"; done
+    
+    # リポジトリ検索 (find)
+    cmd_repos_run="find ${(q)base} -maxdepth $depth \\( $find_prunes -name .git -type d -print -o -name .git -type f -print \\) 2>/dev/null | sed 's|/\\.git\$||'"
+    
+    # Grep検索用 (grep) - grepはディレクトリ除外が苦手なので、findで見つけてからgrepする形か、exclude-dirを使用
+    # ここではシンプルにするため --exclude-dir が使える前提(GNU grep)または findベース
     cmd_grep_gen() {
       echo "grep -rl --include='README*' -- \"$1\" ${(q)base} 2>/dev/null | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
     }
   fi
 
-  # --- 2. Preview コマンドの最適化 ---
-  # シェル変数を埋め込んで、fzf内で条件分岐を極力減らす
-  # git status は重い場合があるのでタイムアウトなどを考慮しても良いが、ここではシンプルに保持
+  # 共通フィルタ
+  local cmd_repos="$cmd_repos_run | grep -v '/\\.git/' | LC_ALL=C sort -u"
+
+
+  # --- 3. Preview コマンド (変更なし) ---
   local preview_cmd="
     target={}; 
     if [ -d \"\$target\" ]; then
@@ -83,11 +111,10 @@ fgit() {
       echo \"Not a directory: \$target\";
     fi
   "
-  # 改行を詰めて1行にする（fzfへの渡しやすさのため）
   preview_cmd=${preview_cmd//  /} 
   preview_cmd=${preview_cmd//$'\n'/ }
 
-  # --- 3. FZF 実行 ---
+  # --- 4. FZF 実行 ---
 
   local selected
   selected=$(
