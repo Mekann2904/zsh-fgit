@@ -1,22 +1,10 @@
-## === fgit (高速リポジトリ/プロジェクト移動) === 
+## === fgit (高速リポジトリ移動) ===
 fgit() {
   emulate -L zsh
   setopt localoptions pipefail no_aliases
 
   local base=${1:-$HOME}
   local depth=${FGIT_DEPTH:-5}
-
-  # 直前に作ったプロジェクトも拾いたい場合の「目印ファイル」
-  # ':' 区切りで上書き可。空にすると Git リポジトリのみ。
-  local markers_default='package.json:pyproject.toml:Cargo.toml:go.mod:Gemfile:pom.xml:build.gradle:build.gradle.kts:Makefile:.tool-versions:Pipfile:poetry.lock'
-  local markers=${FGIT_MARKERS:-$markers_default}
-
-  # スキャン結果キャッシュ（短TTLで “連打/フォーカスリロード” を軽くする）
-  # 0 で無効
-  local cache_ttl=${FGIT_CACHE_TTL:-2}
-
-  # スキャン除外（':' 区切り）
-  local exclude=${FGIT_EXCLUDE:-'node_modules:.cache'}
 
   base=${base:A}
   if [[ ! -d $base ]]; then
@@ -28,161 +16,65 @@ fgit() {
     return 127
   fi
 
+  # 外側シェル（この関数）用にクォート済みの base
   local base_q=${(q)base}
   local depth_q=${(q)depth}
-  local markers_q=${(q)markers}
-  local cache_ttl_q=${(q)cache_ttl}
-  local exclude_q=${(q)exclude}
 
-  # ---- 一覧生成（Git + markers） ----
-  # ・fd があれば fd 優先
-  # ・短TTLキャッシュ（1回の起動中に何度もreloadしても安定/高速）
-  local cmd_list
-  cmd_list="zsh -c '
-    emulate -L zsh
-    setopt pipefail no_aliases
+  # bat / batcat 吸収
+  local bat_cmd=bat
+  command -v bat >/dev/null 2>&1 || { command -v batcat >/dev/null 2>&1 && bat_cmd=batcat; }
 
+  # リポジトリ列挙（.git がディレクトリ/ファイル両方に対応。/.git/ 配下は除外）
+  local cmd_repos
+  cmd_repos="zsh -c '
     base=\$1
     depth=\$2
-    markers_str=\$3
-    ttl=\$4
-    exclude_str=\$5
 
-    local now=\${EPOCHSECONDS:-\$(date +%s)}
-    local cache_dir=\${XDG_CACHE_HOME:-\$HOME/.cache}/fgit
-    command mkdir -p -- \"\$cache_dir\" 2>/dev/null || true
-
-    local key_src=\"\$base|\$depth|\$markers_str|\$exclude_str\"
-    local key
-    if command -v sha1sum >/dev/null 2>&1; then
-      key=\$(print -nr -- \"\$key_src\" | sha1sum | awk \"{print \\$1}\")
-    elif command -v shasum >/dev/null 2>&1; then
-      key=\$(print -nr -- \"\$key_src\" | shasum -a 1 | awk \"{print \\$1}\")
-    elif command -v md5sum >/dev/null 2>&1; then
-      key=\$(print -nr -- \"\$key_src\" | md5sum | awk \"{print \\$1}\")
-    elif command -v md5 >/dev/null 2>&1; then
-      key=\$(print -nr -- \"\$key_src\" | md5 | awk \"{print \\$NF}\")
+    if command -v fd >/dev/null 2>&1; then
+      fd -H -I -t d -t f --max-depth \"\$depth\" \"^\\\\.git\$\" \"\$base\" -x echo {//} 2>/dev/null
     else
-      key=\$(print -nr -- \"\$key_src\" | cksum | awk \"{print \\$1}\")
-    fi
+      find \"\$base\" -maxdepth \"\$depth\" \\( -name .git -type d -o -name .git -type f \\) 2>/dev/null \
+        | sed \"s|/\\\\.git\$||\"
+    fi \
+      | command grep -v \"/\\\\.git/\" \
+      | LC_ALL=C sort -u
+  ' _ $base_q $depth_q"
 
-    local cache_file=\"\$cache_dir/list-\$key.txt\"
-    if (( ttl > 0 )) && [[ -f \$cache_file ]]; then
-      local first=\$(command head -n 1 -- \"\$cache_file\" 2>/dev/null)
-      if [[ \$first == \"#ts=\"* ]]; then
-        local ts=\${first#\\#ts=}
-        if [[ \$ts == <-> ]] && (( now - ts <= ttl )); then
-          command tail -n +2 -- \"\$cache_file\" 2>/dev/null
-          exit 0
-        fi
-      fi
-    fi
-
-    local tmp=\"\$cache_file.\$\$.\$RANDOM\"
-
-    {
-      print -r -- \"#ts=\$now\"
-
-      # ---- Git repos ----
-      if command -v fd >/dev/null 2>&1; then
-        local fd_opts
-        fd_opts=( -H -t d -t f --max-depth \"\$depth\" --regex \"^\\\\.git\$\" \"\$base\" )
-
-        # 除外
-        local ex
-        for ex in \${(s.:.)exclude_str}; do
-          [[ -n \$ex ]] && fd_opts+=( --exclude \"\$ex\" )
-        done
-
-        fd \"\${fd_opts[@]}\" -x echo {//} 2>/dev/null
-      else
-        # find fallback：.git 自体は降りない（-prune）で少し軽くする
-        command find \"\$base\" -maxdepth \"\$depth\" \
-          \\( -name .git -type d -prune -print -o -name .git -type f -print \\) 2>/dev/null \
-          | sed \"s|/\\\\.git\$||\"
-      fi
-
-      # ---- non-git projects by marker files (markers_str が空ならスキップ) ----
-      if [[ -n \$markers_str ]] && command -v fd >/dev/null 2>&1; then
-        local mopts=( -H -t f --max-depth \"\$depth\" \"\$base\" )
-        local ex
-        for ex in \${(s.:.)exclude_str}; do
-          [[ -n \$ex ]] && mopts+=( --exclude \"\$ex\" )
-        done
-
-        local m
-        for m in \${(s.:.)markers_str}; do
-          [[ -n \$m ]] || continue
-          fd \"\${mopts[@]}\" -g \"\$m\" -x echo {//} 2>/dev/null
-        done
-      fi
-
-    } | command grep -v \"/\\\\.git/\" | LC_ALL=C sort -u >| \"\$tmp\" && command mv -f -- \"\$tmp\" \"\$cache_file\"
-
-    command tail -n +2 -- \"\$cache_file\" 2>/dev/null
-  ' _ $base_q $depth_q $markers_q $cache_ttl_q $exclude_q"
-
-  # ---- Grep (README*) ----
-  # ※Grepモードでは fzf の検索を disable して「READMEでヒットしたがパスにクエリが無いので消える」を防ぐ
+  # README 内を検索して候補ディレクトリを返す（クエリは引数で受け取る）
   local cmd_grep
   cmd_grep="zsh -c '
-    emulate -L zsh
-    setopt pipefail no_aliases
-
     q=\$1
     base=\$2
-    exclude_str=\$3
     [[ -n \$q ]] || exit 0
 
     if command -v rg >/dev/null 2>&1; then
-      local ropts=( --files-with-matches --glob \"README*\" --smart-case -- \"\$q\" \"\$base\" )
-      local ex
-      for ex in \${(s.:.)exclude_str}; do
-        [[ -n \$ex ]] && ropts=( --glob \"!\$ex/**\" \"\${ropts[@]}\" )
-      done
-      rg \"\${ropts[@]}\" 2>/dev/null
+      rg --files-with-matches --glob \"README*\" --smart-case -- \"\$q\" \"\$base\" 2>/dev/null
     else
-      # grep fallback（環境差があるので最低限）
       grep -rl --include=\"README*\" -- \"\$q\" \"\$base\" 2>/dev/null
     fi \
       | sed \"s|/[^/]*\$||\" \
       | command grep -v \"/\\\\.git/\" \
       | LC_ALL=C sort -u
-  ' _ {q} $base_q $exclude_q"
+  ' _ {q} $base_q"
 
-  # ---- Preview（重い処理を抑える） ----
+  # プレビュー（README 優先。ついでに軽い Git 情報を表示）
   local preview_cmd
   preview_cmd="zsh -c '
-    emulate -L zsh
-    setopt pipefail no_aliases
-
     target=\$1
     [[ -d \$target ]] || { print -r -- \"Not a directory: \$target\"; exit 0; }
 
-    # bat / batcat
-    local bat_cmd=
-    if command -v bat >/dev/null 2>&1; then
-      bat_cmd=bat
-    elif command -v batcat >/dev/null 2>&1; then
-      bat_cmd=batcat
-    fi
-
-    # git info（-uno で未追跡の走査を避けて安定化/高速化）
-    if command -v git >/dev/null 2>&1 && git -C \"\$target\" rev-parse --git-dir >/dev/null 2>&1; then
-      local br=\$(git -C \"\$target\" rev-parse --abbrev-ref HEAD 2>/dev/null)
-      print -P \"%F{cyan}%B[git]%b%f \${br}\"
-      git -C \"\$target\" status -sb -uno 2>/dev/null | head -n 20
+    if command -v git >/dev/null 2>&1 && git -C \"\$target\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      print -P \"%F{cyan}%B[git]%b%f \$(git -C \"\$target\" rev-parse --abbrev-ref HEAD 2>/dev/null)\"
+      git -C \"\$target\" status -sb 2>/dev/null | head -n 20
       print
     fi
 
-    # README（find ではなく glob で軽く拾う）
-    local readme
-    readme=(\"\$target\"/(#i)readme*(N[1]))
+    readme=\$(find \"\$target\" -maxdepth 1 -iname \"readme*\" -type f -print -quit 2>/dev/null)
     if [[ -n \$readme ]]; then
-      if [[ -n \$bat_cmd ]]; then
-        \$bat_cmd --style=numbers --color=always --line-range :120 \"\$readme\"
+      if command -v $bat_cmd >/dev/null 2>&1; then
+        $bat_cmd --style=numbers --color=always --line-range :120 \"\$readme\"
       else
-        command head -n 120 \"\$readme\"
+        head -n 120 \"\$readme\"
       fi
       exit 0
     fi
@@ -193,7 +85,7 @@ fgit() {
     elif command -v tree >/dev/null 2>&1; then
       tree -L 2 \"\$target\" 2>/dev/null | head -n 200
     else
-      ls -F \"\$target\" 2>/dev/null | head -n 60
+      ls -F \"\$target\" 2>/dev/null | head -n 40
     fi
   ' _ {}"
 
@@ -201,27 +93,19 @@ fgit() {
   selected=$(
     fzf --ansi \
       --layout=reverse --border --prompt='Repos> ' \
-      --header=$'ENTER:Go | CTRL-G:Switch (Repos <-> Grep) | CTRL-R:Refresh | CTRL-P:Toggle preview' \
+      --header='ENTER:Go | CTRL-G:Switch Mode (Repos <-> Grep)' \
       --preview="$preview_cmd" \
       --preview-window='right:60%:border-rounded:wrap' \
-      --bind "start:reload:$cmd_list" \
-      --bind "focus:reload:$cmd_list" \
-      --bind "ctrl-p:toggle-preview" \
-      --bind "ctrl-r:transform:
-        if [[ \"{fzf:prompt}\" == \"Grep> \" ]]; then
-          echo 'reload($cmd_grep)'
-        else
-          echo 'reload($cmd_list)'
-        fi" \
+      --bind "start:reload:$cmd_repos" \
       --bind "ctrl-g:transform:
         if [[ \"{fzf:prompt}\" == \"Repos> \" ]]; then
-          echo 'change-prompt(Grep> )+disable-search+clear-query+rebind(change)+reload($cmd_grep)'
+          echo 'change-prompt(Grep> )+clear-query+rebind(change)+reload($cmd_grep)'
         else
-          echo 'change-prompt(Repos> )+enable-search+clear-query+unbind(change)+reload($cmd_list)'
+          echo 'change-prompt(Repos> )+unbind(change)+reload($cmd_repos)'
         fi" \
       --bind "change:transform:
         if [[ \"{fzf:prompt}\" == \"Grep> \" ]]; then
-          echo 'reload(sleep 0.12; $cmd_grep)'
+          echo 'reload($cmd_grep)'
         fi"
   )
 
