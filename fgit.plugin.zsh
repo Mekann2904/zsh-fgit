@@ -2,8 +2,19 @@ fgit() {
   emulate -L zsh
   setopt localoptions pipefail no_aliases
 
+  if (( $# > 1 )); then
+    print -u2 "usage: fgit [base-directory]"
+    return 2
+  fi
+
   local base=${1:-$HOME}
   local depth=${FGIT_DEPTH:-5}
+
+  if [[ $depth != <-> || $depth -lt 1 ]]; then
+    print -u2 "fgit: FGIT_DEPTH must be a positive integer: $depth"
+    return 2
+  fi
+
   base=${base:A}
 
   if [[ ! -d $base ]]; then
@@ -53,47 +64,47 @@ fgit() {
   # --- 2. 検索コマンドの構築 (除外設定の反映) ---
 
   local cmd_repos_run
-  local cmd_grep_base
-
+  local cmd_grep
   if command -v fd >/dev/null 2>&1; then
     # fd 用の除外オプション生成 (-E "dir1" -E "dir2" ...)
     local fd_excludes=""
     for d in $ignore_dirs; do fd_excludes+=" -E ${(q)d}"; done
-    
+
     # リポジトリ検索 (fd) — base からの相対パスで出力（fzf マッチが /Users/... に汚染されないように）
     cmd_repos_run="fd -H -I -t d -t f --max-depth $depth --base-directory ${(q)base} $fd_excludes '^\\.git$' -x echo {//}"
     
-    # Grep検索用 (rg) - fdと同様の除外をglobで指定
-    local rg_excludes=""
-    for d in $ignore_dirs; do rg_excludes+=" --glob '!${(q)d}'"; done
-    
-    cmd_grep_base="cd ${(q)base} && rg --files-with-matches --max-count 1 --glob 'README*' --smart-case --no-messages $rg_excludes"
-    cmd_grep_gen() {
-      echo "$cmd_grep_base -- \"$1\" . 2>/dev/null | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
-    }
-
   else
     # find 用の除外オプション生成 (-name "dir1" -prune -o -name "dir2" -prune -o ...)
     local find_prunes=""
     for d in $ignore_dirs; do find_prunes+=" -name ${(q)d} -prune -o"; done
-    
+
     # リポジトリ検索 (find) — base からの相対パスで出力
-    cmd_repos_run="cd ${(q)base} && find . -maxdepth $depth \\( $find_prunes -name .git -type d -print -o -name .git -type f -print \\) 2>/dev/null | sed 's|/\\.git\$||' | sed 's|^\\./||'"
-    
-    # Grep検索用 (grep) - grepはディレクトリ除外が苦手なので、findで見つけてからgrepする形か、exclude-dirを使用
-    # ここではシンプルにするため --exclude-dir が使える前提(GNU grep)または findベース
-    cmd_grep_gen() {
-      echo "cd ${(q)base} && grep -rl --include='README*' -- \"$1\" . 2>/dev/null | sed 's|/[^/]*\$||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
-    }
+    cmd_repos_run="cd ${(q)base} && find . -maxdepth $depth \\( $find_prunes -name .git -type d -print -o -name .git -type f -print \\) 2>/dev/null | sed 's|/\\.git\$||'"
+  fi
+
+  if command -v rg >/dev/null 2>&1; then
+    # Grep検索用 (rg)
+    local rg_excludes=""
+    for d in $ignore_dirs; do rg_excludes+=" --glob '!**/${(q)d}/**'"; done
+
+    local cmd_grep_base="cd ${(q)base} && rg --files-with-matches --max-count 1 --glob 'README*' --smart-case --no-messages $rg_excludes"
+    # fzf safely shell-quotes the {q} placeholder when it expands it.
+    cmd_grep="$cmd_grep_base -- {q} . 2>/dev/null | sed 's|/[^/]*\$||; s|^\\./||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
+  else
+    local grep_excludes=""
+    for d in $ignore_dirs; do grep_excludes+=" --exclude-dir=${(q)d}"; done
+
+    cmd_grep="cd ${(q)base} && grep -rl --include='README*' $grep_excludes -- {q} . 2>/dev/null | sed 's|/[^/]*\$||; s|^\\./||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
   fi
 
   # 共通フィルタ（fd/find の出力は base 相対）
-  local cmd_repos="$cmd_repos_run | grep -v '/\\.git/' | LC_ALL=C sort -u"
+  local cmd_repos="$cmd_repos_run | sed 's|^\\./||' | grep -v '/\\.git/' | LC_ALL=C sort -u"
+  local cmd_grep_empty=${cmd_grep//\{q\}/"''"}
 
 
   # --- 3. Preview コマンド（{} は base 相対なので絶対パスに復元） ---
   local preview_cmd="
-    target=\"${base}/{}\";
+    target=${(q)base}/{};
     if [ -d \"\$target\" ]; then
       if [ -d \"\$target/.git\" ] || [ -f \"\$target/.git\" ]; then
         echo -e \"\x1b[36m[git]\x1b[m \$(git -C \"\$target\" rev-parse --abbrev-ref HEAD 2>/dev/null)\";
@@ -116,6 +127,8 @@ fgit() {
 
   # --- 4. FZF 実行 ---
 
+  local switch_to_grep="change-prompt(Grep> )+clear-query+rebind(change)+reload:$cmd_grep_empty"
+  local switch_to_repos="change-prompt(Repos> )+unbind(change)+reload:$cmd_repos"
   local selected
   selected=$(
     fzf --ansi \
@@ -123,16 +136,13 @@ fgit() {
       --header='ENTER:Go | CTRL-G:Switch Mode (Repos <-> Grep)' \
       --preview="$preview_cmd" \
       --preview-window='right:60%:border-rounded:wrap' \
-      --bind "start:reload:$cmd_repos" \
+      --bind "start:unbind(change)+reload:$cmd_repos" \
+      --bind "change:reload:$cmd_grep" \
       --bind "ctrl-g:transform:
-        if [[ \"{fzf:prompt}\" == \"Repos> \" ]]; then
-          echo 'change-prompt(Grep> )+clear-query+rebind(change)+reload:$(cmd_grep_gen {q})'
+        if [[ {fzf:prompt} == \"Repos> \" ]]; then
+          printf '%s\n' ${(qq)switch_to_grep}
         else
-          echo 'change-prompt(Repos> )+unbind(change)+reload($cmd_repos)'
-        fi" \
-      --bind "change:transform:
-        if [[ \"{fzf:prompt}\" == \"Grep> \" ]]; then
-          echo 'reload:$(cmd_grep_gen {q})'
+          printf '%s\n' ${(qq)switch_to_repos}
         fi"
   )
 
@@ -145,4 +155,3 @@ fgit() {
     fi
   fi
 }
-
